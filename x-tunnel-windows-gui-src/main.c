@@ -925,7 +925,7 @@ void CreateControls(HWND hwnd) {
     int numW = Scale(50);
     int numX = connX + Scale(85);
 
-    hConnEdit = CreateWindow("EDIT", "4", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER, 
+    hConnEdit = CreateWindow("EDIT", "3", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER, 
         numX, innerY, numW, editH, hwnd, (HMENU)ID_CONN_EDIT, NULL, NULL);
     SendMessage(hConnEdit, WM_SETFONT, (WPARAM)hFontUI, TRUE);
 
@@ -1053,7 +1053,7 @@ void InitDefaultServer() {
     strcpy(servers[0].ip, "");
     strcpy(servers[0].dns, "");
     strcpy(servers[0].ech, "");
-    servers[0].connections = 4;
+    servers[0].connections = 3;
     strcpy(servers[0].block, "443");
     strcpy(servers[0].ips, "");
 }
@@ -1129,7 +1129,7 @@ void AddNewServer() {
         memset(newServer, 0, sizeof(ServerConfig));
         strcpy(newServer->server, "wss://example.com:443");
         strcpy(newServer->listen, "socks5://127.0.0.1:30000,http://127.0.0.1:30001");
-        newServer->connections = 4;
+        newServer->connections = 3;
         strcpy(newServer->block, "443");
     }
     
