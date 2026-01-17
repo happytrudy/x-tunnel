@@ -438,6 +438,8 @@ async fn dial_websocket(addr: &str, client_id: &str, token: Option<&str>) -> Res
     let (ws, _) = connect_async(request).await?;
     Ok(ws)
 }
+
+async fn fetch_ech_keys(doh_url: &str, domain: &str) -> Result<Vec<u8>> {
     let client = Client::new();
     let mut query = build_dns_query(domain, 65); // HTTPS type
     let dns_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&query);
