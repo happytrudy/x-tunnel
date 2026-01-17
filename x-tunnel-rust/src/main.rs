@@ -1,62 +1,55 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, WebSocketStream};
-use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket as TokioUdpSocket};
+use tokio::sync::{mpsc, oneshot, broadcast};
+use tokio::time::{timeout, sleep};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::{handshake::client::Request, Message};
+use url::Url;
+use uuid::Uuid;
 use serde::{Deserialize, Serialize};
 use clap::Parser;
-use uuid::Uuid;
-use reqwest::Client;
+use log::{info, warn, error};
 use base64::{Engine as _, engine::general_purpose};
-use log::{info, error, warn};
-use thiserror::Error;
+use reqwest::Client;
+use hickory_resolver::Resolver;
+use hickory_resolver::config::*;
+use bytes::{Bytes, BytesMut};
 
 #[derive(Parser)]
 #[command(name = "x-tunnel-client")]
-#[command(about = "SOCKS5 proxy client with WebSocket and ECH support")]
 struct Args {
     #[arg(short, long)]
     config: Option<String>,
-
     #[arg(short = 'l', long)]
     listen: Option<String>,
-
     #[arg(short = 'f', long)]
     forward: Option<String>,
-
     #[arg(short, long)]
     ip: Option<String>,
-
     #[arg(short, long, default_value = "443")]
     block: String,
-
     #[arg(short, long)]
     insecure: bool,
-
     #[arg(short, long)]
     token: Option<String>,
-
-    #[arg(short, long, default_value = "https://doh.pub/dns-query")]
-    dns: String,
-
-    #[arg(short, long, default_value = "cloudflare-ech.com")]
-    ech: String,
-
-    #[arg(short, long)]
-    fallback: bool,
-
     #[arg(short = 'n', long, default_value = "3")]
     connection_num: usize,
-
+    #[arg(short, long, default_value = "https://doh.pub/dns-query")]
+    dns: String,
+    #[arg(short, long, default_value = "cloudflare-ech.com")]
+    ech: String,
+    #[arg(short, long)]
+    fallback: bool,
     #[arg(short, long)]
     ips: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Deserialize)]
 struct FileConfig {
     listen: Option<String>,
     forward: Option<String>,
@@ -77,7 +70,7 @@ struct FileConfig {
     reconnect_delay: Option<Duration>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct GlobalConfig {
     dial_timeout: Duration,
     ws_handshake_timeout: Duration,
@@ -104,41 +97,32 @@ impl Default for GlobalConfig {
     }
 }
 
-#[derive(Debug, Error)]
-enum AppError {
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    #[error("YAML error: {0}")]
-    Yaml(#[from] serde_yaml::Error),
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("Parse error: {0}")]
-    Parse(String),
-    #[error("ECH not supported in Rust")]
-    EchNotSupported,
+#[derive(Clone, Copy)]
+enum IpStrategy {
+    Default,
+    IPv4Only,
+    IPv6Only,
+    IPv4IPv6,
+    IPv6IPv4,
 }
 
-type Result<T> = std::result::Result<T, AppError>;
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum MessageType {
-    TcpConnect = 1,
-    TcpData,
-    TcpClose,
-    UdpConnect,
-    UdpData,
-    UdpClose,
+    TCPConnect = 1,
+    TCPData,
+    TCPClose,
+    UDPConnect,
+    UDPData,
+    UDPClose,
     ConnStatus,
     Uplink,
     SelectDownlink,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum ConnStatus {
-    Ok = 0,
-    Err = 1,
+    OK = 0,
+    ERR = 1,
 }
 
 const HEADER_LEN: usize = 8;
@@ -149,8 +133,8 @@ fn encode_message(msg_type: MessageType, conn_id: &str, meta: &[u8], payload: &[
     buf[0] = msg_type as u8;
     buf[1] = conn_id.len() as u8;
     let meta_len = meta.len() as u16;
-    let payload_len = payload.len() as u32;
     buf[2..4].copy_from_slice(&meta_len.to_be_bytes());
+    let payload_len = payload.len() as u32;
     buf[4..8].copy_from_slice(&payload_len.to_be_bytes());
     let mut off = HEADER_LEN;
     buf[off..off + conn_id.len()].copy_from_slice(conn_id.as_bytes());
@@ -161,28 +145,28 @@ fn encode_message(msg_type: MessageType, conn_id: &str, meta: &[u8], payload: &[
     buf
 }
 
-fn decode_message(data: &[u8]) -> Result<(MessageType, String, Vec<u8>, Vec<u8>)> {
+fn decode_message(data: &[u8]) -> Result<(MessageType, String, Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     if data.len() < HEADER_LEN {
-        return Err(AppError::Parse("frame too short".to_string()));
+        return Err("frame too short".into());
     }
     let msg_type = match data[0] {
-        1 => MessageType::TcpConnect,
-        2 => MessageType::TcpData,
-        3 => MessageType::TcpClose,
-        4 => MessageType::UdpConnect,
-        5 => MessageType::UdpData,
-        6 => MessageType::UdpClose,
+        1 => MessageType::TCPConnect,
+        2 => MessageType::TCPData,
+        3 => MessageType::TCPClose,
+        4 => MessageType::UDPConnect,
+        5 => MessageType::UDPData,
+        6 => MessageType::UDPClose,
         7 => MessageType::ConnStatus,
         8 => MessageType::Uplink,
         9 => MessageType::SelectDownlink,
-        _ => return Err(AppError::Parse("invalid message type".to_string())),
+        _ => return Err("invalid message type".into()),
     };
     let id_len = data[1] as usize;
     let meta_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     let payload_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
     let total = HEADER_LEN + id_len + meta_len + payload_len;
     if total > data.len() {
-        return Err(AppError::Parse("invalid length".to_string()));
+        return Err("invalid length".into());
     }
     let mut off = HEADER_LEN;
     let conn_id = String::from_utf8_lossy(&data[off..off + id_len]).to_string();
@@ -193,153 +177,37 @@ fn decode_message(data: &[u8]) -> Result<(MessageType, String, Vec<u8>, Vec<u8>)
     Ok((msg_type, conn_id, meta, payload))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-    let args = Args::parse();
-
-    let mut cfg = GlobalConfig::default();
-
-    // Load config from file if specified
-    if let Some(config_file) = &args.config {
-        let data = std::fs::read(config_file)?;
-        let file_config: FileConfig = serde_yaml::from_slice(&data)?;
-        // Apply file config to args and cfg
-        // Similar to Go code
-    }
-
-    let listen_addr = args.listen.as_deref().unwrap_or_else(|| {
-        eprintln!("Listen address required");
-        std::process::exit(1);
-    });
-
-    let forward_addr = args.forward.as_deref().unwrap_or_else(|| {
-        eprintln!("Forward address required");
-        std::process::exit(1);
-    });
-
-    let ip_strategy = parse_ip_strategy(args.ips.as_deref().unwrap_or(""));
-    let target_ips: Vec<String> = args.ip.as_ref().map(|s| s.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default();
-    let udp_block_ports: HashMap<u16, ()> = args.block.split(',').filter_map(|s| s.trim().parse().ok()).map(|p| (p, ())).collect();
-
-    let client_id = Uuid::new_v4().to_string();
-    info!("Client ID: {}", client_id);
-
-    // ECH preparation - placeholder since rustls doesn't support ECH
-    if !args.fallback {
-        warn!("ECH not supported in this Rust implementation, falling back to standard TLS");
-    }
-
-    let ech_pool = Arc::new(EchPool::new(forward_addr.to_string(), args.connection_num, target_ips, client_id));
-    ech_pool.start().await;
-
-    run_socks5_listener(listen_addr, ech_pool).await?;
-
-    Ok(())
+#[derive(Clone)]
+struct ClientConnState {
+    req_type: String,
+    tcp_conn: Option<Arc<Mutex<TcpStream>>>,
+    udp_assoc: Option<Arc<UDPAssociation>>,
+    uplink: i32,
+    downlink: i32,
+    last_ch: i32,
+    start: Instant,
+    target: String,
+    connected: Option<oneshot::Sender<bool>>,
+    client_addr: String,
+    closed: bool,
 }
 
-fn parse_ip_strategy(s: &str) -> u8 {
-    match s {
-        "4" => 1,
-        "6" => 2,
-        "4,6" => 3,
-        "6,4" => 4,
-        _ => 0,
-    }
-}
-
-async fn run_socks5_listener(addr: &str, pool: Arc<EchPool>) -> Result<()> {
-    let addr = addr.strip_prefix("socks5://").unwrap_or(addr);
-    let listener = TcpListener::bind(addr).await?;
-    info!("SOCKS5 proxy listening on: {}", addr);
-
-    loop {
-        let (socket, _) = listener.accept().await?;
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_socks5(socket, &pool).await {
-                error!("SOCKS5 handle error: {:?}", e);
-            }
-        });
-    }
-}
-
-async fn handle_socks5(mut socket: TcpStream, pool: &EchPool) -> Result<()> {
-    // Implement SOCKS5 protocol
-    // This is simplified, need full implementation
-    // For brevity, assume connect command
-
-    // Read version and methods
-    let mut buf = [0u8; 2];
-    socket.read_exact(&mut buf).await?;
-    if buf[0] != 0x05 {
-        return Ok(());
-    }
-    let nmethods = buf[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    socket.read_exact(&mut methods).await?;
-
-    // No auth
-    socket.write_all(&[0x05, 0x00]).await?;
-
-    // Read request
-    let mut head = [0u8; 4];
-    socket.read_exact(&mut head).await?;
-    if head[0] != 0x05 || head[1] != 0x01 {
-        return Ok(());
-    }
-
-    let target = match head[3] {
-        0x01 => {
-            let mut ip = [0u8; 4];
-            socket.read_exact(&mut ip).await?;
-            format!("{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], 0)
+impl ClientConnState {
+    fn new() -> Self {
+        Self {
+            req_type: String::new(),
+            tcp_conn: None,
+            udp_assoc: None,
+            uplink: 0,
+            downlink: 0,
+            last_ch: 0,
+            start: Instant::now(),
+            target: String::new(),
+            connected: None,
+            client_addr: String::new(),
+            closed: false,
         }
-        0x03 => {
-            let mut len = [0u8; 1];
-            socket.read_exact(&mut len).await?;
-            let mut domain = vec![0u8; len[0] as usize];
-            socket.read_exact(&mut domain).await?;
-            let domain = String::from_utf8_lossy(&domain);
-            let mut port = [0u8; 2];
-            socket.read_exact(&mut port).await?;
-            let port = u16::from_be_bytes(port);
-            format!("{}:{}", domain, port)
-        }
-        0x04 => {
-            let mut ip = [0u8; 16];
-            socket.read_exact(&mut ip).await?;
-            let ip = std::net::Ipv6Addr::from(ip);
-            let mut port = [0u8; 2];
-            socket.read_exact(&mut port).await?;
-            let port = u16::from_be_bytes(port);
-            format!("[{}]:{}", ip, port)
-        }
-        _ => return Ok(()),
-    };
-
-    // Send success response
-    socket.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-
-    let conn_id = Uuid::new_v4().to_string();
-    pool.register_and_broadcast_tcp(conn_id.clone(), &target, None, socket).await;
-
-    // Handle data forwarding
-    // This needs more implementation
-
-    Ok(())
-}
-
-struct EchPool {
-    ws_server_addr: String,
-    connection_num: usize,
-    target_ips: Vec<String>,
-    client_id: String,
-    ws_conns: Mutex<Vec<Option<WebSocketStream<tokio::net::TcpStream>>>>,
-    write_queues: Vec<tokio::sync::mpsc::Sender<WriteJob>>,
-    conns: Mutex<HashMap<String, ClientConnState>>,
-    global_queue_bytes: std::sync::atomic::AtomicI64,
-    global_queue_limit: i64,
+    }
 }
 
 struct WriteJob {
@@ -348,191 +216,853 @@ struct WriteJob {
     size: i64,
 }
 
-struct ClientConnState {
-    tcp_conn: Option<TcpStream>,
-    udp_assoc: Option<Arc<UdpAssociation>>,
-    uplink: Option<usize>,
-    downlink: Option<usize>,
-    start: std::time::Instant,
-    target: String,
-    req_type: String,
-    client_addr: Option<SocketAddr>,
-    closed: bool,
+struct ECHPool {
+    global_queue_bytes: AtomicI64,
+    global_queue_limit: i64,
+    next_channel: AtomicU64,
+    ws_server_addr: String,
+    connection_num: usize,
+    target_ips: Vec<String>,
+    client_id: String,
+    ws_conns: Vec<Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>>,
+    write_queues: Vec<mpsc::UnboundedSender<WriteJob>>,
+    conns: Arc<RwLock<HashMap<String, ClientConnState>>>,
 }
 
-impl EchPool {
+impl ECHPool {
     fn new(addr: String, n: usize, ips: Vec<String>, client_id: String) -> Self {
         let total = if ips.is_empty() { n } else { ips.len() * n };
+        let mut ws_conns = Vec::with_capacity(total);
         let mut write_queues = Vec::with_capacity(total);
         for _ in 0..total {
-            let (tx, _) = tokio::sync::mpsc::channel(4096);
-            write_queues.push(tx);
+            ws_conns.push(Arc::new(Mutex::new(None)));
+            write_queues.push(mpsc::unbounded_channel().0);
         }
         Self {
+            global_queue_bytes: AtomicI64::new(0),
+            global_queue_limit: (64 * 1024 * 512) as i64,
+            next_channel: AtomicU64::new(0),
             ws_server_addr: addr,
             connection_num: n,
             target_ips: ips,
             client_id,
-            ws_conns: Mutex::new(vec![None; total]),
+            ws_conns,
             write_queues,
-            conns: Mutex::new(HashMap::new()),
-            global_queue_bytes: std::sync::atomic::AtomicI64::new(0),
-            global_queue_limit: (64 * 1024 * 512) as i64,
+            conns: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    fn ch_index(&self, ch_id: usize) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let idx = ch_id - 1;
+        if idx >= self.write_queues.len() {
+            return Err(format!("invalid channel {}", ch_id).into());
+        }
+        Ok(idx)
     }
 
     async fn start(&self) {
         for i in 0..self.write_queues.len() {
             let ip = if self.target_ips.is_empty() {
-                None
+                String::new()
             } else {
-                Some(self.target_ips[i / self.connection_num].clone())
+                let idx = i / self.connection_num;
+                if idx < self.target_ips.len() {
+                    self.target_ips[idx].clone()
+                } else {
+                    String::new()
+                }
             };
-            let pool = // need Arc<Self>
-            // This needs refactoring to Arc
+            let pool = self.clone();
+            tokio::spawn(async move {
+                pool.dial_and_serve(i, &ip).await;
+            });
         }
     }
 
-    async fn register_and_broadcast_tcp(&self, conn_id: String, target: &str, first: Option<&[u8]>, tcp_conn: TcpStream) {
-        let mut conns = self.conns.lock().await;
-        let state = ClientConnState {
-            tcp_conn: Some(tcp_conn),
-            udp_assoc: None,
-            uplink: None,
-            downlink: None,
-            start: std::time::Instant::now(),
-            target: target.to_string(),
-            req_type: "SOCKS5".to_string(),
-            client_addr: None,
-            closed: false,
-        };
-        conns.insert(conn_id.clone(), state);
+    async fn dial_and_serve(&self, idx: usize, ip: &str) {
+        let ch_id = idx + 1;
+        loop {
+            let ws_conn = match dial_websocket_with_ech(&self.ws_server_addr, 3, ip, &self.client_id).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    error!("[client] channel {} (IP:{}) connect failed: {}", ch_id, ip, e);
+                    sleep(self.reconnect_delay).await;
+                    continue;
+                }
+            };
+            *self.ws_conns[idx].lock().unwrap() = Some(ws_conn);
+            info!("[client] channel {} (IP:{}) ready", ch_id, ip);
 
-        let meta = vec![0u8; 1 + target.len()]; // ip_strategy + target
-        // copy
-        let msg = encode_message(MessageType::TcpConnect, &conn_id, &meta, first.unwrap_or(&[]));
-        self.broadcast_write(Message::Binary(msg)).await;
+            let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+            self.write_queues[idx] = write_tx;
+
+            let pool = self.clone();
+            let ws_conn_clone = self.ws_conns[idx].clone();
+            tokio::spawn(async move {
+                pool.write_worker(ws_conn_clone, write_rx).await;
+            });
+
+            let pool = self.clone();
+            let ws_conn_clone = self.ws_conns[idx].clone();
+            pool.handle_channel(ch_id, ws_conn_clone).await;
+
+            *self.ws_conns[idx].lock().unwrap() = None;
+            pool.cleanup_channel(ch_id).await;
+            error!("[client] channel {} disconnected, reconnecting...", ch_id);
+            sleep(self.reconnect_delay).await;
+        }
+    }
+
+    async fn write_worker(&self, ws_conn: Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>, mut rx: mpsc::UnboundedReceiver<WriteJob>) {
+        let mut ticker = tokio::time::interval(self.ping_interval);
+        loop {
+            tokio::select! {
+                job = rx.recv() => {
+                    if let Some(job) = job {
+                        self.global_queue_bytes.fetch_sub(job.size, Ordering::Relaxed);
+                        let mut conn = ws_conn.lock().unwrap();
+                        if let Some(ref mut c) = *conn {
+                            if let Err(_) = c.send(Message::Binary(job.data)).await {
+                                return;
+                            }
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+                _ = ticker.tick() => {
+                    let mut conn = ws_conn.lock().unwrap();
+                    if let Some(ref mut c) = *conn {
+                        if let Err(_) = c.send(Message::Ping(vec![])).await {
+                            return;
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_channel(&self, ch_id: usize, ws_conn: Arc<Mutex<Option<WebSocketStream<MaybeTlsStream<TcpStream>>>>>) {
+        let mut conn = ws_conn.lock().unwrap().take().unwrap();
+        loop {
+            match conn.next().await {
+                Some(Ok(msg)) => {
+                    if let Message::Binary(data) = msg {
+                        if let Ok((msg_type, conn_id, meta, payload)) = decode_message(&data) {
+                            self.note_last_channel(&conn_id, ch_id as i32).await;
+                            match msg_type {
+                                MessageType::Uplink => {
+                                    self.note_uplink(&conn_id, ch_id as i32).await;
+                                }
+                                MessageType::ConnStatus => {
+                                    if meta.len() >= 1 && meta[0] == ConnStatus::OK as u8 {
+                                        self.signal_connected(&conn_id).await;
+                                    } else {
+                                        self.unregister(&conn_id).await;
+                                    }
+                                }
+                                MessageType::TCPData => {
+                                    let (selected, chosen, start, target, up, typ) = self.select_downlink(&conn_id, ch_id as i32).await;
+                                    if selected {
+                                        let msg = encode_message(MessageType::SelectDownlink, &conn_id, &[], &[]);
+                                        self.async_write_direct(ch_id, Message::Binary(msg).into(), msg.len() as i64).await.ok();
+                                        if start.elapsed().as_millis() > 0 && up > 0 {
+                                            info!("[client] {} {} access: {}, channel: TX {} RX {}, ID:{}, latency {:.1} ms",
+                                                "-", typ, target, up, ch_id, &conn_id[..8], start.elapsed().as_millis());
+                                        }
+                                    }
+                                    if chosen == ch_id as i32 {
+                                        let conns = self.conns.read().await;
+                                        if let Some(st) = conns.get(&conn_id) {
+                                            if let Some(ref tcp_conn) = st.tcp_conn {
+                                                let mut conn = tcp_conn.lock().await;
+                                                conn.write_all(&payload).await.ok();
+                                            }
+                                        }
+                                    }
+                                }
+                                MessageType::TCPClose => {
+                                    self.note_uplink(&conn_id, ch_id as i32).await;
+                                    let conns = self.conns.read().await;
+                                    if let Some(st) = conns.get(&conn_id) {
+                                        if let Some(ref tcp_conn) = st.tcp_conn {
+                                            let mut conn = tcp_conn.lock().await;
+                                            conn.shutdown().await.ok();
+                                        }
+                                    }
+                                    self.unregister(&conn_id).await;
+                                }
+                                MessageType::UDPData => {
+                                    let (selected, chosen, start, target, up, typ) = self.select_downlink(&conn_id, ch_id as i32).await;
+                                    if selected {
+                                        let msg = encode_message(MessageType::SelectDownlink, &conn_id, &[], &[]);
+                                        self.async_write_direct(ch_id, Message::Binary(msg).into(), msg.len() as i64).await.ok();
+                                        if start.elapsed().as_millis() > 0 && up > 0 {
+                                            info!("[client] {} {} access: {}, channel: TX {} RX {}, ID:{}, latency {:.1} ms",
+                                                "-", typ, target, up, ch_id, &conn_id[..8], start.elapsed().as_millis());
+                                        }
+                                    }
+                                    if chosen == ch_id as i32 {
+                                        let conns = self.conns.read().await;
+                                        if let Some(st) = conns.get(&conn_id) {
+                                            if let Some(ref udp_assoc) = st.udp_assoc {
+                                                udp_assoc.handle_udp_response(String::from_utf8_lossy(&meta).to_string(), payload).await;
+                                            }
+                                        }
+                                    }
+                                }
+                                MessageType::UDPClose => {
+                                    self.note_uplink(&conn_id, ch_id as i32).await;
+                                    let conns = self.conns.read().await;
+                                    if let Some(st) = conns.get(&conn_id) {
+                                        if let Some(ref udp_assoc) = st.udp_assoc {
+                                            udp_assoc.close().await;
+                                        }
+                                    }
+                                    self.unregister(&conn_id).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Some(Err(_)) => return,
+                None => return,
+            }
+        }
+    }
+
+    async fn async_write_direct(&self, ch_id: usize, msg: Message, size: i64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let idx = self.ch_index(ch_id)?;
+        if self.global_queue_bytes.fetch_add(size, Ordering::Relaxed) > self.global_queue_limit {
+            self.global_queue_bytes.fetch_sub(size, Ordering::Relaxed);
+            return Err("queue limit exceeded".into());
+        }
+        if let Err(_) = self.write_queues[idx].send(WriteJob { msg_type: 0, data: msg.into_data(), size }) {
+            self.global_queue_bytes.fetch_sub(size, Ordering::Relaxed);
+            return Err("channel congested".into());
+        }
+        Ok(())
     }
 
     async fn broadcast_write(&self, msg: Message) {
-        // Implement broadcasting
-    }
-}
-
-async fn dial_websocket(addr: &str, client_id: &str, token: Option<&str>) -> Result<WebSocketStream<tokio::net::TcpStream>> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-
-    let mut request = addr.into_client_request()?;
-    {
-        let headers = request.headers_mut();
-        let mut url = reqwest::Url::parse(addr)?;
-        let mut query = url.query_pairs_mut();
-        query.append_pair("client_id", client_id);
-        drop(query);
-        *request.uri_mut() = url.as_str().parse()?;
-        if let Some(token) = token {
-            headers.insert("Sec-WebSocket-Protocol", token.parse()?);
+        for (i, queue) in self.write_queues.iter().enumerate() {
+            if self.ws_conns[i].lock().unwrap().is_some() {
+                let size = msg.len() as i64;
+                if self.global_queue_bytes.fetch_add(size, Ordering::Relaxed) > self.global_queue_limit {
+                    self.global_queue_bytes.fetch_sub(size, Ordering::Relaxed);
+                    continue;
+                }
+                queue.send(WriteJob { msg_type: 0, data: msg.clone().into_data(), size }).ok();
+            }
         }
     }
 
+    async fn note_uplink(&self, conn_id: &str, ch_id: i32) {
+        let mut conns = self.conns.write().await;
+        if let Some(st) = conns.get_mut(conn_id) {
+            if st.uplink == 0 {
+                st.uplink = ch_id;
+            }
+        }
+    }
+
+    async fn note_last_channel(&self, conn_id: &str, ch_id: i32) {
+        let mut conns = self.conns.write().await;
+        if let Some(st) = conns.get_mut(conn_id) {
+            st.last_ch = ch_id;
+        }
+    }
+
+    async fn get_uplink_channel(&self, conn_id: &str) -> Option<i32> {
+        let conns = self.conns.read().await;
+        conns.get(conn_id).and_then(|st| if st.uplink != 0 { Some(st.uplink) } else { None })
+    }
+
+    async fn register_and_broadcast_tcp(&self, conn_id: String, target: String, first: Option<Vec<u8>>, tcp_conn: TcpStream, req_type: String) {
+        let mut conns = self.conns.write().await;
+        let mut st = conns.entry(conn_id.clone()).or_insert(ClientConnState::new());
+        st.tcp_conn = Some(Arc::new(Mutex::new(tcp_conn)));
+        st.target = target.clone();
+        st.start = Instant::now();
+        st.req_type = req_type;
+        st.uplink = 0;
+        st.downlink = 0;
+        drop(conns);
+
+        let mut meta = vec![0u8]; // ip_strategy
+        meta.extend_from_slice(target.as_bytes());
+        let msg = encode_message(MessageType::TCPConnect, &conn_id, &meta, &first.unwrap_or_default());
+        self.broadcast_write(Message::Binary(msg));
+    }
+
+    async fn register_udp(&self, conn_id: String, assoc: Arc<UDPAssociation>) {
+        let mut conns = self.conns.write().await;
+        let mut st = conns.entry(conn_id.clone()).or_insert(ClientConnState::new());
+        st.udp_assoc = Some(assoc);
+        st.req_type = "SOCKS5 UDP".to_string();
+        drop(conns);
+    }
+
+    async fn start_udp_race(&self, conn_id: String, target: String) {
+        let mut conns = self.conns.write().await;
+        let mut st = conns.entry(conn_id.clone()).or_insert(ClientConnState::new());
+        st.target = target.clone();
+        st.start = Instant::now();
+        st.req_type = "SOCKS5 UDP".to_string();
+        st.uplink = 0;
+        st.downlink = 0;
+        drop(conns);
+
+        let mut meta = vec![0u8]; // ip_strategy
+        meta.extend_from_slice(target.as_bytes());
+        let msg = encode_message(MessageType::UDPConnect, &conn_id, &meta, &[]);
+        self.broadcast_write(Message::Binary(msg));
+    }
+
+    async fn unregister(&self, conn_id: &str) {
+        let mut conns = self.conns.write().await;
+        if let Some(mut st) = conns.remove(conn_id) {
+            if st.closed {
+                return;
+            }
+            st.closed = true;
+            let target = st.target.clone();
+            let up = if st.uplink != 0 { st.uplink } else { st.last_ch };
+            let down = if st.downlink != 0 { st.downlink } else { st.last_ch };
+            let u = if up > 0 { up.to_string() } else { "-".to_string() };
+            let d = if down > 0 { down.to_string() } else { "-".to_string() };
+            let client = st.client_addr.clone();
+            let typ = if st.req_type.is_empty() { "SOCKS5".to_string() } else { st.req_type.clone() };
+            let target = if target.is_empty() { "-".to_string() } else { target };
+            info!("[client] {} {} access: {}, channel: TX {} RX {}, ID:{}, closed", client, typ, target, u, d, &conn_id[..8]);
+            if let Some(ref tcp_conn) = st.tcp_conn {
+                let mut conn = tcp_conn.lock().await;
+                conn.shutdown().await.ok();
+            }
+            if let Some(ref udp_assoc) = st.udp_assoc {
+                udp_assoc.close().await;
+            }
+        }
+    }
+
+    async fn select_downlink(&self, conn_id: &str, ch_id: i32) -> (bool, i32, Instant, String, i32, String) {
+        let mut conns = self.conns.write().await;
+        if let Some(st) = conns.get_mut(conn_id) {
+            if st.target.is_empty() {
+                return (false, 0, Instant::now(), String::new(), 0, String::new());
+            }
+            let chosen = if st.downlink != 0 {
+                st.downlink
+            } else {
+                st.downlink = ch_id;
+                ch_id
+            };
+            let selected = st.downlink == ch_id;
+            let start = st.start;
+            let target = st.target.clone();
+            let uplink = st.uplink;
+            let typ = st.req_type.clone();
+            (selected, chosen, start, target, uplink, typ)
+        } else {
+            (false, 0, Instant::now(), String::new(), 0, String::new())
+        }
+    }
+
+    async fn signal_connected(&self, id: &str) {
+        let conns = self.conns.read().await;
+        if let Some(st) = conns.get(id) {
+            if let Some(tx) = &st.connected {
+                tx.send(true).ok();
+            }
+        }
+    }
+
+    async fn send_data_direct(&self, ch_id: usize, conn_id: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = encode_message(MessageType::TCPData, conn_id, &[], data);
+        self.async_write_direct(ch_id, Message::Binary(msg), data.len() as i64).await
+    }
+
+    async fn send_close_direct(&self, ch_id: usize, conn_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = encode_message(MessageType::TCPClose, conn_id, &[], &[]);
+        self.async_write_direct(ch_id, Message::Binary(msg), 0).await
+    }
+
+    async fn send_udp_data_direct(&self, ch_id: usize, conn_id: &str, data: &[u8]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = encode_message(MessageType::UDPData, conn_id, &[], data);
+        self.async_write_direct(ch_id, Message::Binary(msg), data.len() as i64).await
+    }
+
+    async fn send_udp_close_direct(&self, ch_id: usize, conn_id: &str) {
+        let msg = encode_message(MessageType::UDPClose, conn_id, &[], &[]);
+        self.async_write_direct(ch_id, Message::Binary(msg), 0).await.ok();
+        self.unregister(conn_id).await;
+    }
+
+    async fn cleanup_channel(&self, ch_id: usize) {
+        let mut to_close = Vec::new();
+        {
+            let conns = self.conns.read().await;
+            for (id, st) in conns.iter() {
+                if st.uplink == ch_id as i32 || st.downlink == ch_id as i32 {
+                    to_close.push(id.clone());
+                }
+            }
+        }
+        for id in to_close {
+            let conns = self.conns.read().await;
+            if let Some(st) = conns.get(&id) {
+                if let Some(ref tcp_conn) = st.tcp_conn {
+                    let mut conn = tcp_conn.lock().await;
+                    conn.shutdown().await.ok();
+                }
+                if let Some(ref udp_assoc) = st.udp_assoc {
+                    udp_assoc.close().await;
+                }
+            }
+            self.unregister(&id).await;
+        }
+    }
+}
+
+impl Clone for ECHPool {
+    fn clone(&self) -> Self {
+        Self {
+            global_queue_bytes: AtomicI64::new(self.global_queue_bytes.load(Ordering::Relaxed)),
+            global_queue_limit: self.global_queue_limit,
+            next_channel: AtomicU64::new(self.next_channel.load(Ordering::Relaxed)),
+            ws_server_addr: self.ws_server_addr.clone(),
+            connection_num: self.connection_num,
+            target_ips: self.target_ips.clone(),
+            client_id: self.client_id.clone(),
+            ws_conns: self.ws_conns.clone(),
+            write_queues: self.write_queues.clone(),
+            conns: self.conns.clone(),
+        }
+    }
+}
+
+struct UDPAssociation {
+    conn_id: String,
+    tcp_conn: TcpStream,
+    udp_listener: TokioUdpSocket,
+    client_udp_addr: Option<SocketAddr>,
+    pool: ECHPool,
+    closed: Mutex<bool>,
+    receiving: Mutex<bool>,
+    channel_id: Mutex<i32>,
+    done: mpsc::UnboundedSender<()>,
+}
+
+impl UDPAssociation {
+    fn new(conn_id: String, tcp_conn: TcpStream, udp_listener: TokioUdpSocket, pool: ECHPool) -> Arc<Self> {
+        let (done_tx, _) = mpsc::unbounded_channel();
+        Arc::new(Self {
+            conn_id,
+            tcp_conn,
+            udp_listener,
+            client_udp_addr: None,
+            pool,
+            closed: Mutex::new(false),
+            receiving: Mutex::new(false),
+            channel_id: Mutex::new(-1),
+            done: done_tx,
+        })
+    }
+
+    async fn loop_udp(self: Arc<Self>) {
+        let mut buf = [0u8; 65536];
+        loop {
+            match self.udp_listener.recv_from(&mut buf).await {
+                Ok((n, addr)) => {
+                    let mut client_addr = self.client_udp_addr.lock().unwrap();
+                    if client_addr.is_none() {
+                        *client_addr = Some(addr);
+                    } else if *client_addr != Some(addr) {
+                        continue;
+                    }
+                    drop(client_addr);
+                    if let Ok((tgt, data)) = parse_socks5_udp_packet(&buf[..n]) {
+                        // check block ports
+                        if let Ok((_, port_str)) = tgt.rsplit_once(':') {
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                if udp_block_ports.contains(&port) {
+                                    continue;
+                                }
+                            }
+                        }
+                        self.send(tgt, data).await;
+                    }
+                }
+                Err(_) => {
+                    self.done.send(()).ok();
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn send(&self, target: String, data: Vec<u8>) {
+        let mut closed = self.closed.lock().unwrap();
+        if *closed {
+            return;
+        }
+        let mut receiving = self.receiving.lock().unwrap();
+        let need_start = !*receiving;
+        if need_start {
+            *receiving = true;
+        }
+        let ch_id = *self.channel_id.lock().unwrap();
+        drop(receiving);
+        drop(closed);
+
+        if need_start {
+            self.pool.start_udp_race(self.conn_id.clone(), target).await;
+        }
+
+        if ch_id < 0 {
+            if let Some(id) = self.pool.get_uplink_channel(&self.conn_id).await {
+                *self.channel_id.lock().unwrap() = id;
+            } else {
+                self.pool.broadcast_write(Message::Binary(encode_message(MessageType::UDPData, &self.conn_id, &[], &data))).await;
+                return;
+            }
+        }
+        self.pool.send_udp_data_direct(ch_id as usize, &self.conn_id, &data).await.ok();
+    }
+
+    async fn handle_udp_response(&self, addr_str: String, data: Vec<u8>) {
+        if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+            if let Some(client_addr) = self.client_udp_addr {
+                let pkt = build_socks5_udp_packet(&addr, &data);
+                self.udp_listener.send_to(&pkt, client_addr).await.ok();
+            }
+        }
+    }
+
+    async fn close(&self) {
+        let mut closed = self.closed.lock().unwrap();
+        if *closed {
+            return;
+        }
+        *closed = true;
+        let receiving = *self.receiving.lock().unwrap();
+        let ch_id = *self.channel_id.lock().unwrap();
+        drop(closed);
+
+        if receiving {
+            if ch_id >= 0 {
+                self.pool.send_udp_close_direct(ch_id as usize, &self.conn_id).await;
+            } else {
+                self.pool.broadcast_write(Message::Binary(encode_message(MessageType::UDPClose, &self.conn_id, &[], &[]))).await;
+                self.pool.unregister(&self.conn_id).await;
+            }
+        } else {
+            self.pool.unregister(&self.conn_id).await;
+        }
+        self.udp_listener.shutdown().await.ok();
+    }
+}
+
+fn parse_socks5_udp_packet(data: &[u8]) -> Result<(String, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    if data.len() < 10 || data[2] != 0 {
+        return Err("invalid data".into());
+    }
+    let mut off = 4;
+    let host = match data[3] {
+        1 => {
+            if off + 4 > data.len() {
+                return Err("ipv4 too short".into());
+            }
+            let ip = Ipv4Addr::from([data[off], data[off+1], data[off+2], data[off+3]]);
+            off += 4;
+            ip.to_string()
+        }
+        3 => {
+            if off + 1 > data.len() {
+                return Err("domain length missing".into());
+            }
+            let len = data[off] as usize;
+            off += 1;
+            if off + len > data.len() {
+                return Err("domain too short".into());
+            }
+            let h = String::from_utf8_lossy(&data[off..off + len]).to_string();
+            off += len;
+            h
+        }
+        4 => {
+            if off + 16 > data.len() {
+                return Err("ipv6 too short".into());
+            }
+            let ip = Ipv6Addr::from([
+                ((data[off] as u16) << 8) | data[off+1] as u16,
+                ((data[off+2] as u16) << 8) | data[off+3] as u16,
+                ((data[off+4] as u16) << 8) | data[off+5] as u16,
+                ((data[off+6] as u16) << 8) | data[off+7] as u16,
+                ((data[off+8] as u16) << 8) | data[off+9] as u16,
+                ((data[off+10] as u16) << 8) | data[off+11] as u16,
+                ((data[off+12] as u16) << 8) | data[off+13] as u16,
+                ((data[off+14] as u16) << 8) | data[off+15] as u16,
+            ]);
+            off += 16;
+            ip.to_string()
+        }
+        _ => return Err("invalid address type".into()),
+    };
+    if off + 2 > data.len() {
+        return Err("port too short".into());
+    }
+    let port = ((data[off] as u16) << 8) | data[off + 1] as u16;
+    off += 2;
+    let target = format!("{}:{}", host, port);
+    Ok((target, data[off..].to_vec()))
+}
+
+fn build_socks5_udp_packet(addr: &SocketAddr, data: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0, 0, 0];
+    match addr {
+        SocketAddr::V4(v4) => {
+            buf.push(1);
+            buf.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            buf.push(4);
+            for seg in &v6.ip().segments() {
+                buf.extend_from_slice(&seg.to_be_bytes());
+            }
+        }
+    }
+    buf.extend_from_slice(&(addr.port()).to_be_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+async fn dial_websocket_with_ech(addr: &str, retries: usize, ip: &str, client_id: &str) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut url = Url::parse(addr)?;
+    if url.scheme() != "wss" {
+        return Err("only wss supported".into());
+    }
+    let mut query = url.query_pairs_mut();
+    if !client_id.is_empty() {
+        query.append_pair("client_id", client_id);
+    }
+    drop(query);
+    let request = Request::get(url.as_str()).body(())?;
+    // For simplicity, use default TLS config, no ECH since not supported
     let (ws, _) = connect_async(request).await?;
     Ok(ws)
 }
 
-async fn fetch_ech_keys(doh_url: &str, domain: &str) -> Result<Vec<u8>> {
-    let client = Client::new();
-    let mut query = build_dns_query(domain, 65); // HTTPS type
-    let dns_b64 = general_purpose::URL_SAFE_NO_PAD.encode(&query);
-    let url = format!("{}?dns={}", doh_url, dns_b64);
-    let resp = client.get(&url).header("Accept", "application/dns-message").send().await?;
-    let body = resp.bytes().await?;
-    parse_dns_response(&body)
+async fn run_socks5_listener(addr: &str, pool: Arc<ECHPool>) {
+    let listener = TcpListener::bind(addr).await?;
+    info!("[client] SOCKS5 proxy: {}", addr);
+    loop {
+        let (socket, _) = listener.accept().await?;
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            handle_socks5(socket, pool).await;
+        });
+    }
 }
 
-fn build_dns_query(domain: &str, qtype: u16) -> Vec<u8> {
-    let mut query = vec![0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-    for label in domain.split('.') {
-        query.push(label.len() as u8);
-        query.extend_from_slice(label.as_bytes());
+async fn handle_socks5(mut socket: TcpStream, pool: Arc<ECHPool>) {
+    let mut buf = [0u8; 2];
+    if socket.read_exact(&mut buf).await.is_err() || buf[0] != 0x05 {
+        return;
     }
-    query.push(0x00);
-    query.extend_from_slice(&(qtype as u16).to_be_bytes());
-    query.extend_from_slice(&1u16.to_be_bytes());
-    query
-}
+    let methods = vec![0u8; buf[1] as usize];
+    if socket.read_exact(&methods).await.is_err() {
+        return;
+    }
+    // Assume no auth for simplicity
+    socket.write_all(&[0x05, 0x00]).await.ok();
 
-fn parse_dns_response(response: &[u8]) -> Result<String> {
-    if response.len() < 12 {
-        return Err(AppError::Parse("response too short".to_string()));
+    let mut head = [0u8; 4];
+    if socket.read_exact(&mut head).await.is_err() {
+        return;
     }
-    let ancount = u16::from_be_bytes([response[6], response[7]]);
-    if ancount == 0 {
-        return Err(AppError::Parse("no answer".to_string()));
-    }
-    let mut offset = 12;
-    // Skip question
-    while offset < response.len() && response[offset] != 0 {
-        offset += response[offset] as usize + 1;
-    }
-    offset += 5;
-    for _ in 0..ancount {
-        if offset >= response.len() {
-            break;
+    let mut target = String::new();
+    match head[3] {
+        1 => {
+            let mut b = [0u8; 4];
+            socket.read_exact(&mut b).await.ok();
+            target = IpAddr::V4(Ipv4Addr::from(b)).to_string();
         }
-        if response[offset] & 0xC0 == 0xC0 {
-            offset += 2;
-        } else {
-            while offset < response.len() && response[offset] != 0 {
-                offset += response[offset] as usize + 1;
+        3 => {
+            let mut b = [0u8; 1];
+            socket.read_exact(&mut b).await.ok();
+            let mut addr = vec![0u8; b[0] as usize];
+            socket.read_exact(&mut addr).await.ok();
+            target = String::from_utf8_lossy(&addr).to_string();
+        }
+        4 => {
+            let mut b = [0u8; 16];
+            socket.read_exact(&mut b).await.ok();
+            target = IpAddr::V6(Ipv6Addr::from(b)).to_string();
+        }
+        _ => return,
+    }
+    let mut pb = [0u8; 2];
+    socket.read_exact(&mut pb).await.ok();
+    let port = ((pb[0] as u16) << 8) | pb[1] as u16;
+    target = format!("{}:{}", target, port);
+
+    socket.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+
+    match head[1] {
+        1 => handle_socks5_connect(socket, target, pool).await,
+        3 => handle_socks5_udp(socket, pool).await,
+        _ => {}
+    }
+}
+
+async fn handle_socks5_connect(mut socket: TcpStream, target: String, pool: Arc<ECHPool>) {
+    let conn_id = Uuid::new_v4().to_string();
+    pool.register_and_broadcast_tcp(conn_id.clone(), target, None, socket, "SOCKS5".to_string()).await;
+
+    let mut buf = [0u8; 65536];
+    loop {
+        match socket.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(ch_id) = pool.get_uplink_channel(&conn_id).await {
+                    pool.send_data_direct(ch_id as usize, &conn_id, &buf[..n]).await.ok();
+                } else {
+                    let msg = encode_message(MessageType::TCPData, &conn_id, &[], &buf[..n]);
+                    pool.broadcast_write(Message::Binary(msg)).await;
+                }
             }
-            offset += 1;
-        }
-        if offset + 10 > response.len() {
-            break;
-        }
-        let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-        offset += 8;
-        let data_len = u16::from_be_bytes([response[offset], response[offset + 1]]);
-        offset += 2;
-        if offset + data_len as usize > response.len() {
-            break;
-        }
-        let data = &response[offset..offset + data_len as usize];
-        offset += data_len as usize;
-        if rr_type == 65 {
-            if let Some(ech) = parse_https_record(data) {
-                return Ok(ech);
-            }
+            Err(_) => break,
         }
     }
-    Err(AppError::Parse("no HTTPS record".to_string()))
-}
-
-fn parse_https_record(data: &[u8]) -> Option<String> {
-    if data.len() < 2 {
-        return None;
-    }
-    let mut offset = 2;
-    if offset < data.len() && data[offset] == 0 {
-        offset += 1;
+    if let Some(ch_id) = pool.get_uplink_channel(&conn_id).await {
+        pool.send_close_direct(ch_id as usize, &conn_id).await.ok();
     } else {
-        while offset < data.len() && data[offset] != 0 {
-            offset += data[offset] as usize + 1;
-        }
-        offset += 1;
+        let msg = encode_message(MessageType::TCPClose, &conn_id, &[], &[]);
+        pool.broadcast_write(Message::Binary(msg)).await;
     }
-    while offset + 4 <= data.len() {
-        let key = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        let length = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-        offset += 4;
-        if offset + length as usize > data.len() {
-            break;
+    pool.unregister(&conn_id).await;
+}
+
+async fn handle_socks5_udp(mut socket: TcpStream, pool: Arc<ECHPool>) {
+    let addr = socket.local_addr().unwrap();
+    let udp_socket = TokioUdpSocket::bind("0.0.0.0:0").await.unwrap();
+    let actual = udp_socket.local_addr().unwrap();
+    let mut resp = vec![0x05, 0x00, 0x00];
+    match actual {
+        SocketAddr::V4(v4) => {
+            resp.push(1);
+            resp.extend_from_slice(&v4.ip().octets());
         }
-        let value = &data[offset..offset + length as usize];
-        offset += length as usize;
-        if key == 5 {
-            return Some(general_purpose::STANDARD.encode(value));
+        SocketAddr::V6(v6) => {
+            resp.push(4);
+            for seg in &v6.ip().segments() {
+                resp.extend_from_slice(&seg.to_be_bytes());
+            }
         }
     }
-    None
+    resp.extend_from_slice(&(actual.port()).to_be_bytes());
+    socket.write_all(&resp).await.ok();
+
+    let conn_id = Uuid::new_v4().to_string();
+    let assoc = UDPAssociation::new(conn_id.clone(), socket, udp_socket, (*pool).clone());
+    pool.register_udp(conn_id, assoc.clone()).await;
+    assoc.loop_udp().await;
+}
+
+lazy_static::lazy_static! {
+    static ref UDP_BLOCK_PORTS: HashSet<u16> = {
+        let mut set = HashSet::new();
+        for port in "443".split(',') {
+            if let Ok(p) = port.trim().parse::<u16>() {
+                set.insert(p);
+            }
+        }
+        set
+    };
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    env_logger::init();
+    let args = Args::parse();
+
+    let mut cfg = GlobalConfig::default();
+    let mut listen_addr = args.listen;
+    let mut forward_addr = args.forward;
+    let mut ip_addr = args.ip;
+    let mut udp_block_ports_str = args.block;
+    let mut token = args.token;
+    let mut connection_num = args.connection_num;
+    let mut insecure = args.insecure;
+    let mut ips = args.ips;
+    let mut dns_server = args.dns;
+    let mut ech_domain = args.ech;
+    let mut fallback = args.fallback;
+
+    if let Some(config_file) = args.config {
+        let data = tokio::fs::read_to_string(&config_file).await?;
+        let file_config: FileConfig = serde_yaml::from_str(&data)?;
+        // Apply config similar to Go code
+        if listen_addr.is_none() && file_config.listen.is_some() {
+            listen_addr = file_config.listen;
+        }
+        // Similarly for others
+    }
+
+    let listen_addr = listen_addr.ok_or("listen addr required")?;
+    let forward_addr = forward_addr.ok_or("forward addr required")?;
+
+    let ip_strategy = parse_ip_strategy(&ips.unwrap_or_default());
+    if !ips.unwrap_or_default().is_empty() {
+        info!("[client] IP strategy: {} (code: {})", ips.unwrap_or_default(), ip_strategy as u8);
+    }
+
+    let target_ips = if let Some(ip) = ip_addr {
+        ip.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        vec![]
+    };
+
+    let url = Url::parse(&forward_addr)?;
+    if url.scheme() != "wss" {
+        return Err("only wss supported".into());
+    }
+
+    if insecure && !fallback {
+        fallback = true;
+        info!("[client] insecure mode: ECH disabled");
+    }
+
+    // ECH not implemented, use fallback
+    if !fallback {
+        warn!("ECH not supported in this Rust version, using fallback");
+        fallback = true;
+    }
+
+    let client_id = Uuid::new_v4().to_string();
+    info!("[client] client ID: {}", client_id);
+
+    let pool = Arc::new(ECHPool::new(forward_addr, connection_num, target_ips, client_id));
+    pool.start().await;
+
+    run_socks5_listener(&listen_addr, pool).await;
+
+    Ok(())
+}
+
+fn parse_ip_strategy(s: &str) -> IpStrategy {
+    let s = s.trim();
+    match s {
+        "4" => IpStrategy::IPv4Only,
+        "6" => IpStrategy::IPv6Only,
+        "4,6" => IpStrategy::IPv4IPv6,
+        "6,4" => IpStrategy::IPv6IPv4,
+        _ => IpStrategy::Default,
+    }
 }
